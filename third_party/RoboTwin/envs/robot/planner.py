@@ -1,6 +1,7 @@
 import mplib.planner
 import mplib
 import numpy as np
+import os
 import pdb
 import traceback
 import numpy as np
@@ -12,8 +13,8 @@ import envs._GLOBAL_CONFIGS as CONFIGS
 
 try:
     # ********************** CuroboPlanner (optional) **********************
+    from curobo.types.base import TensorDeviceType
     from curobo.types.math import Pose as CuroboPose
-    import time
     from curobo.types.robot import JointState
     from curobo.wrap.reacher.motion_gen import (
         MotionGen,
@@ -27,6 +28,17 @@ try:
     from curobo.util import logger
     logger.setup_logger(level="error", logger_name="curobo")
 
+    # Opt-in knobs copied from the golden FastWAM RoboTwin fork. Defaults retain
+    # upstream behavior; the GRPO launcher enables the fast rollout path.
+    _PLAN_KWARGS = {"max_attempts": int(os.environ.get("ROBOTWIN_CUROBO_MAX_ATTEMPTS", 10))}
+    if os.environ.get("ROBOTWIN_CUROBO_FAST") == "1":
+        _PLAN_KWARGS.update(
+            ik_fail_return=1,
+            enable_graph_attempt=None,
+            enable_finetune_trajopt=False,
+        )
+    _CUROBO_SKIP_BATCH = os.environ.get("ROBOTWIN_CUROBO_SKIP_BATCH_PLANNER") == "1"
+
     class CuroboPlanner:
 
         def __init__(
@@ -35,6 +47,7 @@ try:
             active_joints_name,
             all_joints,
             yml_path=None,
+            device_id=None,
         ):
             super().__init__()
             ta.setup_logging("CRITICAL")  # hide logging
@@ -47,6 +60,13 @@ try:
             self.robot_origion_pose = robot_origion_pose
             self.active_joints_name = active_joints_name
             self.all_joints = all_joints
+
+            if device_id is None:
+                device_id = torch.cuda.current_device() if torch.cuda.is_available() else 0
+            self.device = torch.device("cuda", int(device_id))
+            self.tensor_args = TensorDeviceType(device=self.device)
+            if torch.cuda.is_available():
+                torch.cuda.set_device(self.device)
 
             # translate from baselink to arm's base
             with open(self.yml_path, "r") as f:
@@ -74,15 +94,20 @@ try:
             motion_gen_config = MotionGenConfig.load_from_robot_config(
                 self.yml_path,
                 world_config,
+                tensor_args=self.tensor_args,
                 interpolation_dt=1 / 250,
                 num_trajopt_seeds=1,
             )
 
             self.motion_gen = MotionGen(motion_gen_config)
             self.motion_gen.warmup()
+            if _CUROBO_SKIP_BATCH:
+                self.motion_gen_batch = None
+                return
             motion_gen_config = MotionGenConfig.load_from_robot_config(
                 self.yml_path,
                 world_config,
+                tensor_args=self.tensor_args,
                 interpolation_dt=1 / 250,
                 num_trajopt_seeds=1,
                 num_graph_seeds=1,
@@ -90,13 +115,16 @@ try:
             self.motion_gen_batch = MotionGen(motion_gen_config)
             self.motion_gen_batch.warmup(batch=CONFIGS.ROTATE_NUM)
 
+        def _tensor(self, data, dtype=torch.float32):
+            return torch.as_tensor(data, dtype=dtype, device=self.device)
+
         def plan_path(
             self,
             curr_joint_pos,
             target_gripper_pose,
             constraint_pose=None,
             arms_tag=None,
-        ):  
+        ):
             world_base_pose = np.concatenate([
                 np.array(self.robot_origion_pose.p),
                 np.array(self.robot_origion_pose.q),
@@ -128,11 +156,11 @@ try:
             joint_angles = [curr_joint_pos[index] for index in joint_indices]
             joint_angles = [round(angle, 5) for angle in joint_angles]  # avoid the precision problem
             start_joint_states = JointState.from_position(
-                torch.tensor(joint_angles).cuda().reshape(1, -1),
+                self._tensor(joint_angles).reshape(1, -1),
                 joint_names=self.active_joints_name,
             )
             # plan
-            plan_config = MotionGenPlanConfig(max_attempts=10)
+            plan_config = MotionGenPlanConfig(**_PLAN_KWARGS)
             if constraint_pose is not None:
                 pose_cost_metric = PoseCostMetric(
                     hold_partial_pose=True,
@@ -140,11 +168,20 @@ try:
                 )
                 plan_config.pose_cost_metric = pose_cost_metric
 
-            result = self.motion_gen.plan_single(start_joint_states, goal_pose_of_ee, plan_config)
+            print(f"[ROBOTWIN_PLANNER] stage=plan_single_begin arm={arms_tag}", flush=True)
+            result = self.motion_gen.plan_single(
+                start_joint_states, goal_pose_of_ee, plan_config
+            )
+            plan_succeeded = bool(result.success.item())
+            print(
+                "[ROBOTWIN_PLANNER] stage=plan_single_done "
+                f"arm={arms_tag} success={plan_succeeded}",
+                flush=True,
+            )
 
             # output
             res_result = dict()
-            if result.success.item() == False:
+            if not plan_succeeded:
                 res_result["status"] = "Fail"
                 return res_result
             else:
@@ -208,12 +245,12 @@ try:
                 base_target_pose_list = list(base_target_pose_p) + list(base_target_pose_q)
                 poses_list.append(base_target_pose_list)
 
-            poses_cuda = torch.tensor(poses_list, dtype=torch.float32).cuda()
+            poses_cuda = self._tensor(poses_list)
             goal_pose_of_ee = CuroboPose(poses_cuda[:, :3], poses_cuda[:, 3:])
             joint_indices = [self.all_joints.index(name) for name in self.active_joints_name if name in self.all_joints]
             joint_angles = [curr_joint_pos[index] for index in joint_indices]
             joint_angles = [round(angle, 5) for angle in joint_angles]  # avoid the precision problem
-            joint_angles_cuda = (torch.tensor(joint_angles, dtype=torch.float32).cuda().reshape(1, -1))
+            joint_angles_cuda = self._tensor(joint_angles).reshape(1, -1)
             joint_angles_cuda = torch.cat([joint_angles_cuda] * num_poses, dim=0)
             start_joint_states = JointState.from_position(joint_angles_cuda, joint_names=self.active_joints_name)
             # plan
@@ -225,10 +262,28 @@ try:
                 )
                 plan_config.pose_cost_metric = pose_cost_metric
 
+            print(
+                f"[ROBOTWIN_PLANNER] stage=plan_batch_begin arm={arms_tag} poses={num_poses}",
+                flush=True,
+            )
+            if self.motion_gen_batch is None:
+                raise RuntimeError(
+                    "plan_batch needs ROBOTWIN_CUROBO_SKIP_BATCH_PLANNER unset"
+                )
             try:
                 result = self.motion_gen_batch.plan_batch(start_joint_states, goal_pose_of_ee, plan_config)
             except Exception as e:
+                print(
+                    "[ROBOTWIN_PLANNER] stage=plan_batch_error "
+                    f"arm={arms_tag} poses={num_poses} error_type={type(e).__name__}",
+                    flush=True,
+                )
                 return {"status": ["Failure" for i in range(10)]}
+            print(
+                "[ROBOTWIN_PLANNER] stage=plan_batch_done "
+                f"arm={arms_tag} poses={num_poses}",
+                flush=True,
+            )
 
             # output
             res_result = dict()
@@ -269,7 +324,7 @@ try:
             result_p = wRb.T @ rel_p
             result_q = t3d.quaternions.mat2quat(wRb.T @ wRt)
             return result_p, result_q
-    
+
 except Exception as e:
     print('[planner.py]: Something wrong happened when importing CuroboPlanner! Please check if Curobo is installed correctly. If the problem still exists, you can install Curobo from https://github.com/NVlabs/curobo manually.')
     print('Exception traceback:')
